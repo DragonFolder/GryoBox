@@ -17,7 +17,8 @@
   #hud { position: fixed; left: 0; right: 0; bottom: 0; display: flex; justify-content: space-between; align-items: center;
     padding: 10px 14px calc(10px + env(safe-area-inset-bottom)); font-size: 12px; font-variant-numeric: tabular-nums;
     background: linear-gradient(transparent, rgba(0,0,0,.55)); pointer-events: none; }
-  #hud .btns { display: flex; gap: 8px; pointer-events: auto; }
+  #hud { flex-wrap: wrap; gap: 8px; }
+  #hud .btns { display: flex; flex-wrap: wrap; gap: 8px; pointer-events: auto; }
   #hud button { padding: 7px 12px; font-size: 12px; background: rgba(255,255,255,.12); color: #e8ecf3; }
   #hud button.on { background: #f2a541; color: #1a1205; }
   #hud .left { display: flex; flex-direction: column; gap: 6px; pointer-events: auto; }
@@ -40,6 +41,7 @@
     <label>Speed <input id="time" type="range" min="0.25" max="1" step="0.05"> <span id="timeVal"></span></label>
   </div>
   <div class="btns">
+    <button id="ballBtn"></button>
     <button id="mute" class="on">Sound</button>
     <button id="flip">Invert</button>
     <button id="reset">Reset</button>
@@ -63,14 +65,24 @@ const SIZE_DEFAULT  = 1;     // "Box size" slider: 1 = real screen size, 2 = act
 const SPIN_SCALE    = 1;     // rotation effects (gyro): 1 = physically correct, 0 = off
 const SENSOR_TC     = 0.012; // s, tiny smoothing on sensor input (just evens out 60 Hz steps)
 const DRAG_TC       = 0.08;  // s, smoothing for the desktop drag-to-tilt fallback
-const RESTITUTION   = 0.55;  // bounciness off walls
 const WALL_FRICTION = 2.0;   // slows sliding along a wall in contact
-const AIR_DRAG      = 0.15;
+const AIR_DRAG      = 0.05;  // small linear damping (per second) so nothing drifts forever
 const BALL_R        = 0.22;
 const DEPTH         = 0.55;  // half-depth of the box (into the screen); 1 = half the screen height
-const ROLL_GRIP     = 0.35;  // wall friction coefficient: how well the ball grips to roll instead of slide
+// Ball types. Mass alone doesn't change how a ball falls; what makes one *feel* light or heavy is:
+//   bounce   – coefficient of restitution (share of speed kept after a hit)
+//   grip     – wall friction coefficient (rolls vs slides)
+//   inertia  – moment of inertia as a fraction of m·R² (solid 2/5, hollow shell 2/3: rolls slower)
+//   drag     – air drag, k in a = k·v² (m⁻¹). Matters for light balls: ping-pong ≈ 0.14, rubber ≈ 0.015
+//   squish   – how much it deforms on impact (multiplies IMPACT_SQUISH)
+//   pitch    – multiplies the bounce sound's pitch
+const BALLS = [
+  { name: 'Rubber',    bounce: 0.78, grip: 0.6,  inertia: 2 / 5, drag: 0.015, squish: 1.0,  pitch: 1.0, colors: ['#f2a541', '#c4462f'] },
+  { name: 'Ping-pong', bounce: 0.88, grip: 0.25, inertia: 2 / 3, drag: 0.14,  squish: 0.25, pitch: 3.2, colors: ['#f4f1ea', '#f08a24'] },
+  { name: 'Marble',    bounce: 0.5,  grip: 0.35, inertia: 2 / 5, drag: 0,     squish: 0.12, pitch: 2.2, colors: ['#5fb3d9', '#1d4e89'] },
+];
 const VIEW_DIST_M   = 0.30;  // how far your eyes are from the screen (m); sets a true-to-life perspective
-const TIME_DEFAULT  = 1;     // "Speed" slider: 1 = real time, 0.5 = half-speed slow motion
+const TIME_DEFAULT  = 0.35;  // "Speed" slider: 1 = real time, 0.5 = half-speed slow motion
 
 // Squash & stretch (purely visual — doesn't change the physics).
 // Speeds here are real-world m/s, so the look doesn't change with the box size.
@@ -114,11 +126,15 @@ function gridTexture() {
 }
 
 // Ball with a pattern so you can see it roll
-function ballTexture() {
+let ballIndex = 0;
+try { const i = parseInt(localStorage.getItem('gyrobox-ball'), 10); if (BALLS[i]) ballIndex = i; } catch {}
+let ballType = BALLS[ballIndex];
+
+function ballTexture([base, check] = ballType.colors) {
   const c = document.createElement('canvas'); c.width = 512; c.height = 256;
   const x = c.getContext('2d');
-  x.fillStyle = '#f2a541'; x.fillRect(0, 0, 512, 256);
-  x.fillStyle = '#c4462f';
+  x.fillStyle = base; x.fillRect(0, 0, 512, 256);
+  x.fillStyle = check;
   for (let i = 0; i < 8; i++) for (let j = 0; j < 4; j++)
     if ((i + j) % 2) x.fillRect(i * 64, j * 64, 64, 64);
   const t = new THREE.CanvasTexture(c);
@@ -250,7 +266,8 @@ let frameImpact = 0; // hardest wall hit this frame (m/s), for sound
 const BOUNCE_MIN   = 0.06; // m/s: impacts slower than this are silent and don't squish
 const BOUNCE_FULL  = 1.5;  // m/s: impact speed that plays at full volume
 const BOUNCE_VOL   = 0.6;
-const ROLL_VOL     = 0.12;
+const ROLL_VOL     = 0.045; // max volume of the rolling rumble
+const ROLL_MAX_HZ  = 900;   // cap on how bright the rumble gets (higher = more hissy "swish")
 let actx = null, master, rollGain, rollFilter, noiseBuf;
 let soundOn = true;
 
@@ -287,8 +304,9 @@ function playBounce(speed) {
   // Rubbery "boing": a sine that drops in pitch, higher for harder hits
   const osc = actx.createOscillator();
   osc.type = 'sine';
-  osc.frequency.setValueAtTime(130 + amt * 140 + Math.random() * 20, t);
-  osc.frequency.exponentialRampToValueAtTime(55, t + 0.18);
+  const p = ballType.pitch;
+  osc.frequency.setValueAtTime((130 + amt * 140 + Math.random() * 20) * p, t);
+  osc.frequency.exponentialRampToValueAtTime(55 * p, t + 0.18 / Math.sqrt(p));
   const og = actx.createGain();
   og.gain.setValueAtTime(0.0001, t);
   og.gain.linearRampToValueAtTime(BOUNCE_VOL * amt, t + 0.005);
@@ -313,8 +331,8 @@ function updateRollSound() {
   const onWall = pressing.x + pressing.y + pressing.z > 0;
   const speed = vel.length() / upm; // m/s
   const t = actx.currentTime;
-  rollGain.gain.setTargetAtTime(onWall ? Math.min(speed * 0.3, ROLL_VOL) : 0, t, 0.05);
-  rollFilter.frequency.setTargetAtTime(150 + speed * 1500, t, 0.05);
+  rollGain.gain.setTargetAtTime(onWall ? Math.min(speed * 0.08, ROLL_VOL) : 0, t, 0.05);
+  rollFilter.frequency.setTargetAtTime(Math.min(120 + speed * 600, ROLL_MAX_HZ), t, 0.05);
 }
 
 function clampBall() {
@@ -350,7 +368,8 @@ function step(dt) {
     dOmega.set(0, 0, 0);
   }
 
-  vel.multiplyScalar(1 - AIR_DRAG * dt);
+  // Air drag a = k·v² (real units), i.e. velocity decays at a rate of k·(speed in m/s) per second
+  vel.multiplyScalar(1 - (AIR_DRAG + ballType.drag * (vel.length() / upm)) * dt);
   spin.multiplyScalar(1 - AIR_DRAG * dt);
   pos.addScaledVector(vel, dt);
 
@@ -362,12 +381,12 @@ function step(dt) {
       pos[k] = dir * lim;
       const into = vel[k] * dir;
       if (into > 0) {
-        vel[k] = -vel[k] * RESTITUTION;
+        vel[k] = -vel[k] * ballType.bounce;
         // Only a real arrival counts as a hit. While the ball rests on this wall, gravity pushes it
         // in a little every step; those aren't impacts and shouldn't squish or make sound.
         const hit = into / upm; // m/s
         if (touching[k] !== dir && hit > BOUNCE_MIN) {
-          squashVel[k] += hit * IMPACT_SQUISH;      // kick the squash spring
+          squashVel[k] += hit * IMPACT_SQUISH * ballType.squish; // kick the squash spring
           frameImpact = Math.max(frameImpact, hit);
         }
       }
@@ -406,11 +425,12 @@ const rc = new THREE.Vector3(), slip = new THREE.Vector3(), dv = new THREE.Vecto
 function applyGrip(k, dir, normalDv) {
   rc.set(0, 0, 0); rc[k] = dir * BALL_R;            // centre -> contact point
   slip.crossVectors(spin, rc).add(vel); slip[k] = 0; // contact-point velocity along the wall
-  dv.copy(slip).multiplyScalar(-2 / 7);
-  const maxDv = ROLL_GRIP * normalDv;
+  const beta = ballType.inertia;                     // I = beta·m·R²
+  dv.copy(slip).multiplyScalar(-beta / (1 + beta));  // solid: 2/7, hollow: 2/5
+  const maxDv = ballType.grip * normalDv;
   if (dv.length() > maxDv) dv.setLength(maxDv);      // not enough grip: it partly slides
   vel.add(dv);
-  spin.addScaledVector(tmpB.crossVectors(rc, dv), 2.5 / (BALL_R * BALL_R));
+  spin.addScaledVector(tmpB.crossVectors(rc, dv), 1 / (beta * BALL_R * BALL_R));
 }
 
 // Build ball.matrix = translate * deform * rotate. The deform is a symmetric 3x3 in world space,
@@ -482,6 +502,20 @@ document.getElementById('go').addEventListener('click', async () => {
   }
   addEventListener('devicemotion', onMotion);
   setTimeout(() => { startEl.style.display = 'none'; }, msg.textContent ? 1600 : 0);
+});
+
+const ballBtn = document.getElementById('ballBtn');
+function showBall() { ballBtn.textContent = ballType.name; }
+showBall();
+ballBtn.addEventListener('click', () => {
+  ballIndex = (ballIndex + 1) % BALLS.length;
+  ballType = BALLS[ballIndex];
+  const old = ball.material.map;
+  ball.material.map = ballTexture();
+  ball.material.needsUpdate = true;
+  old.dispose();
+  showBall();
+  try { localStorage.setItem('gyrobox-ball', String(ballIndex)); } catch {}
 });
 
 const muteBtn = document.getElementById('mute');
