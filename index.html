@@ -42,6 +42,7 @@
   </div>
   <div class="btns">
     <button id="ballBtn"></button>
+    <button id="head">Head</button>
     <button id="mute" class="on">Sound</button>
     <button id="flip">Invert</button>
     <button id="reset">Reset</button>
@@ -81,7 +82,14 @@ const BALLS = [
   { name: 'Ping-pong', bounce: 0.88, grip: 0.25, inertia: 2 / 3, drag: 0.14,  squish: 0.25, pitch: 3.2, colors: ['#f4f1ea', '#f08a24'] },
   { name: 'Marble',    bounce: 0.5,  grip: 0.35, inertia: 2 / 5, drag: 0,     squish: 0.12, pitch: 2.2, colors: ['#5fb3d9', '#1d4e89'] },
 ];
-const VIEW_DIST_M   = 0.30;  // how far your eyes are from the screen (m); sets a true-to-life perspective
+const VIEW_DIST_M   = 0.30;  // assumed eye distance from the screen (m) when head tracking is off
+
+// Head tracking (front camera). These are guesses about the phone's camera; adjust if the view feels off.
+const CAM_FOV_DEG   = 70;    // front camera's field of view across the LONGER side of its image
+const CAM_OFFSET_M  = 0.008; // front camera sits this far beyond the top edge of the screen (portrait)
+const EYE_GAP_M     = 0.063; // average distance between a person's pupils
+const EYE_SMOOTH_TC = 0.08;  // s, smoothing of the tracked eye position (higher = steadier, laggier)
+const MP_VER        = '0.10.14'; // @mediapipe/tasks-vision version
 const TIME_DEFAULT  = 0.35;  // "Speed" slider: 1 = real time, 0.5 = half-speed slow motion
 
 // Squash & stretch (purely visual — doesn't change the physics).
@@ -175,15 +183,7 @@ function resize() {
   camera.aspect = aspect;
   half.x = aspect * half.y;
   updateScale();
-  // Field of view as if looking through the real screen from reading distance, so the box behind
-  // it has realistic perspective (a wide FOV exaggerates depth and makes the box read as huge)
-  const screenM = (h / CSS_PX_PER_INCH) * 0.0254;
-  camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan(screenM / 2 / VIEW_DIST_M));
-  // Put the camera so the box's front opening exactly fills the screen
-  const dist = half.y / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
-  camera.position.set(0, 0, half.z + dist);
-  camera.lookAt(0, 0, 0);
-  camera.updateProjectionMatrix();
+  // The camera itself is placed every frame by updateView() (see Head tracking)
   lamp.position.set(0, half.y * 0.6, half.z - 0.15);
   buildRoom();
   clampBall();
@@ -463,6 +463,106 @@ function updateBallMatrix() {
   ball.matrixWorldNeedsUpdate = true;
 }
 
+// ---------- Head tracking: the screen as a window into the box ----------
+// Positions here are in "screen space", in metres: origin at the screen centre, x right, y up,
+// z out of the screen toward the viewer. The camera is put at your eye and its view is skewed
+// (an off-axis frustum) so the screen's edges are exactly the box's front opening.
+const headBtn = document.getElementById('head');
+let headOn = false, headLoading = false;
+let detector = null, video = null, stream = null, lastVideoTime = -1, lastFaceAt = -1e9;
+const eyeDefault = new THREE.Vector3(0, 0, VIEW_DIST_M);
+const eye = eyeDefault.clone();          // smoothed estimate, used to render
+const eyeMeasured = eyeDefault.clone();  // latest camera measurement (kept turning with the gyro)
+const tmpE = new THREE.Vector3();
+
+async function startHead() {
+  headLoading = true; headBtn.textContent = 'Head…';
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    video = document.createElement('video');
+    video.playsInline = true; video.muted = true; video.srcObject = stream;
+    await video.play();
+    if (!detector) {
+      // Loaded only when first switched on. Runs entirely on the phone; no video is sent anywhere.
+      const base = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}`;
+      const { FilesetResolver, FaceDetector } = await import(`${base}/vision_bundle.mjs`);
+      const files = await FilesetResolver.forVisionTasks(`${base}/wasm`);
+      const opts = delegate => ({
+        baseOptions: { delegate, modelAssetPath:
+          'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite' },
+        runningMode: 'VIDEO', minDetectionConfidence: 0.5 });
+      try { detector = await FaceDetector.createFromOptions(files, opts('GPU')); }
+      catch { detector = await FaceDetector.createFromOptions(files, opts('CPU')); }
+    }
+    headOn = true; headBtn.classList.add('on'); headBtn.textContent = 'Head';
+  } catch (err) {
+    console.warn('Head tracking failed:', err);
+    stopHead();
+    headBtn.textContent = 'Head ✕'; // camera denied/unavailable or the model failed to load
+  }
+  headLoading = false;
+}
+
+function stopHead() {
+  headOn = false;
+  stream?.getTracks().forEach(t => t.stop());
+  stream = null; video = null; lastVideoTime = -1;
+  headBtn.classList.remove('on'); headBtn.textContent = 'Head';
+}
+
+headBtn.addEventListener('click', () => { if (!headLoading) headOn ? stopHead() : startHead(); });
+
+function screenHalfM() { return { w: (innerWidth / CSS_PX_PER_INCH) * 0.0254 / 2, h: (innerHeight / CSS_PX_PER_INCH) * 0.0254 / 2 }; }
+
+// Find the eyes in the newest camera frame and turn them into a 3D position
+function trackHead(now) {
+  if (!headOn || !video || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const det = detector.detectForVideo(video, now).detections?.[0];
+  if (!det || det.keypoints.length < 2) return;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const [a, b] = det.keypoints; // the two eyes, in 0..1 image coordinates
+  const ax = a.x * vw, ay = a.y * vh, bx = b.x * vw, by = b.y * vh;
+  const gapPx = Math.hypot(ax - bx, ay - by);
+  if (gapPx < 4) return;
+  // Pinhole camera: focal length in pixels from the field of view; distance from the known eye gap
+  const f = (Math.max(vw, vh) / 2) / Math.tan(THREE.MathUtils.degToRad(CAM_FOV_DEG / 2));
+  const z = THREE.MathUtils.clamp(f * EYE_GAP_M / gapPx, 0.1, 1.2);
+  const u = (ax + bx) / 2 - vw / 2, v = (ay + by) / 2 - vh / 2;
+  // The front camera's image is un-mirrored: image right = phone's left, image down = phone's down
+  const x = -u / f * z, y = -v / f * z;
+  // Shift from the camera's position to the screen centre. In natural portrait the camera is just
+  // above the screen's top edge; rotate that offset like the motion sensor when the screen turns.
+  const s = screenHalfM();
+  const camY = Math.max(s.w, s.h) + CAM_OFFSET_M;
+  const th = screenAngle(), c = Math.cos(th), sn = Math.sin(th);
+  eyeMeasured.set(x + (-sn * camY), y + (c * camY), z);
+  eyeMeasured.x = THREE.MathUtils.clamp(eyeMeasured.x, -0.5, 0.5);
+  eyeMeasured.y = THREE.MathUtils.clamp(eyeMeasured.y, -0.5, 0.5);
+  lastFaceAt = now;
+}
+
+// Place the camera at the eye and skew the view so the screen is a window into the box
+function updateView(realDt) {
+  const faceFresh = headOn && performance.now() - lastFaceAt < 600;
+  // Between camera frames, assume your head stays put while the phone turns: in phone coordinates
+  // the eye then swings the opposite way. This keeps tilting smooth at the camera's low frame rate.
+  if (headOn) {
+    eye.addScaledVector(tmpE.crossVectors(omega, eye), -realDt);
+    eyeMeasured.addScaledVector(tmpE.crossVectors(omega, eyeMeasured), -realDt);
+  }
+  eye.lerp(faceFresh ? eyeMeasured : eyeDefault, 1 - Math.exp(-realDt / EYE_SMOOTH_TC));
+
+  const k = half.y / screenHalfM().h;    // world units per metre on screen
+  const ex = eye.x * k, ey = eye.y * k, d = Math.max(eye.z * k, 0.5);
+  camera.position.set(ex, ey, half.z + d); // the box's front opening is the plane z = half.z
+  const n = camera.near, sc = n / d;
+  camera.projectionMatrix.makePerspective(
+    (-half.x - ex) * sc, (half.x - ex) * sc, (half.y - ey) * sc, (-half.y - ey) * sc, n, camera.far);
+  camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+}
+
 // ---------- Loop ----------
 const readout = document.getElementById('readout');
 let last = performance.now();
@@ -480,9 +580,14 @@ function frame(now) {
     const freeFall = f < 2.5; // < ~¼ g: the phone is falling or mid-toss
     readout.textContent = `force ${f.toFixed(1)} m/s² · spin ${omega.length().toFixed(1)} rad/s${freeFall ? ' · FREE FALL' : ''}`;
     readout.classList.toggle('ff', freeFall);
+    if (headOn) readout.textContent += now - lastFaceAt < 600
+      ? ` · eye ${(eye.x * 100).toFixed(0)}, ${(eye.y * 100).toFixed(0)}, ${(eye.z * 100).toFixed(0)} cm`
+      : ' · no face';
   } else {
     readout.textContent = 'drag to tilt';
   }
+  trackHead(now);
+  updateView(dt / timeScale);
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
