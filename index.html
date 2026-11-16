@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Tilt Box</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0d12; touch-action: none;
+    font-family: system-ui, -apple-system, sans-serif; color: #e8ecf3; -webkit-user-select: none; user-select: none; }
+  canvas { display: block; }
+  #start { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; background: rgba(11,13,18,.92); z-index: 10; text-align: center; padding: 24px; }
+  #start h1 { margin: 0; font-size: 28px; letter-spacing: .5px; }
+  #start p { margin: 0; max-width: 320px; opacity: .7; line-height: 1.45; font-size: 15px; }
+  button { font: inherit; border: 0; border-radius: 999px; padding: 12px 22px; background: #f2a541; color: #1a1205;
+    font-weight: 600; font-size: 16px; }
+  #hud { position: fixed; left: 0; right: 0; bottom: 0; display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom)); font-size: 12px; font-variant-numeric: tabular-nums;
+    background: linear-gradient(transparent, rgba(0,0,0,.55)); pointer-events: none; }
+  #hud .btns { display: flex; gap: 8px; pointer-events: auto; }
+  #hud button { padding: 7px 12px; font-size: 12px; background: rgba(255,255,255,.12); color: #e8ecf3; }
+  #hud button.on { background: #f2a541; color: #1a1205; }
+</style>
+</head>
+<body>
+<div id="start">
+  <h1>Tilt Box</h1>
+  <p>Tilt your phone to roll the ball around a box inside the screen. Shake it to make it bounce.</p>
+  <button id="go">Tap to start</button>
+  <p id="msg" style="font-size:13px"></p>
+</div>
+<div id="hud">
+  <span id="readout">g: –</span>
+  <div class="btns">
+    <button id="flip">Invert</button>
+    <button id="reset">Reset</button>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+// ---------- Tunables ----------
+const GRAVITY_SCALE = 0.55;  // sensor m/s² -> world units/s²
+const SMOOTHING     = 0.25;  // 0..1, higher = more responsive, lower = smoother
+const RESTITUTION   = 0.55;  // bounciness off walls
+const WALL_FRICTION = 2.0;   // slows sliding along a wall in contact
+const AIR_DRAG      = 0.15;
+const BALL_R        = 0.22;
+const DEPTH         = 1.3;   // half-depth of the box (into the screen)
+
+// ---------- Renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0d12);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 50);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+const lamp = new THREE.PointLight(0xfff1dc, 30, 0, 2);
+lamp.castShadow = true;
+lamp.shadow.mapSize.set(1024, 1024);
+lamp.shadow.bias = -0.002;
+scene.add(lamp);
+
+// Grid texture for the walls so depth reads clearly
+function gridTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const x = c.getContext('2d');
+  x.fillStyle = '#1b2130'; x.fillRect(0, 0, 256, 256);
+  x.strokeStyle = '#3a4560'; x.lineWidth = 3;
+  x.strokeRect(0, 0, 256, 256);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+// Ball with a pattern so you can see it roll
+function ballTexture() {
+  const c = document.createElement('canvas'); c.width = 512; c.height = 256;
+  const x = c.getContext('2d');
+  x.fillStyle = '#f2a541'; x.fillRect(0, 0, 512, 256);
+  x.fillStyle = '#c4462f';
+  for (let i = 0; i < 8; i++) for (let j = 0; j < 4; j++)
+    if ((i + j) % 2) x.fillRect(i * 64, j * 64, 64, 64);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+const ball = new THREE.Mesh(
+  new THREE.SphereGeometry(BALL_R, 48, 32),
+  new THREE.MeshStandardMaterial({ map: ballTexture(), roughness: 0.35, metalness: 0.1 })
+);
+ball.castShadow = true;
+scene.add(ball);
+
+let room = null;
+const half = new THREE.Vector3(1, 1, DEPTH); // box half-extents, x set from aspect
+
+function buildRoom() {
+  if (room) { scene.remove(room); room.geometry.dispose(); room.material.forEach(m => { m.map?.dispose(); m.dispose(); }); }
+  const tex = gridTexture();
+  // BoxGeometry face order: +x, -x, +y, -y, +z (front = screen, hidden), -z (back)
+  const reps = [[DEPTH*2, 2], [DEPTH*2, 2], [half.x*2, DEPTH*2], [half.x*2, DEPTH*2], [1,1], [half.x*2, 2]];
+  const mats = reps.map(([u, v], i) => {
+    const t = tex.clone(); t.needsUpdate = true; t.repeat.set(Math.round(u * 2.5), Math.round(v * 2.5));
+    const m = new THREE.MeshStandardMaterial({ map: t, side: THREE.BackSide, roughness: 0.9 });
+    if (i === 4) m.visible = false;
+    return m;
+  });
+  room = new THREE.Mesh(new THREE.BoxGeometry(half.x * 2, half.y * 2, half.z * 2), mats);
+  room.receiveShadow = true;
+  scene.add(room);
+}
+
+function resize() {
+  const w = innerWidth, h = innerHeight, aspect = w / h;
+  renderer.setSize(w, h);
+  camera.aspect = aspect;
+  half.x = aspect * half.y;
+  // Put the camera so the box's front opening exactly fills the screen
+  const dist = half.y / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  camera.position.set(0, 0, half.z + dist);
+  camera.lookAt(0, 0, 0);
+  camera.updateProjectionMatrix();
+  lamp.position.set(0, half.y * 0.6, half.z - 0.15);
+  buildRoom();
+  clampBall();
+}
+
+// ---------- Input: gravity vector ----------
+// Device coords: x right, y up, z out of the screen — the same as three.js camera space here.
+// accelerationIncludingGravity reports the *reaction* to gravity, so world gravity = -reading.
+const gTarget = new THREE.Vector3(0, -9.8, 0);
+const g = gTarget.clone();
+let invert = false;
+let gotSensor = false;
+
+function screenAngle() {
+  const a = (screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0;
+  return THREE.MathUtils.degToRad(a);
+}
+
+function onMotion(e) {
+  const a = e.accelerationIncludingGravity;
+  if (!a || a.x == null) return;
+  gotSensor = true;
+  // Rotate device x/y into screen x/y when the screen is rotated
+  const th = screenAngle(), c = Math.cos(th), s = Math.sin(th);
+  const sx = c * a.x - s * a.y, sy = s * a.x + c * a.y;
+  const sign = invert ? 1 : -1;
+  gTarget.set(sign * sx, sign * sy, sign * a.z);
+}
+
+// Desktop / no-sensor fallback: drag to tilt
+let dragging = false;
+addEventListener('pointerdown', e => { if (!gotSensor && e.target === renderer.domElement) { dragging = true; onDrag(e); } });
+addEventListener('pointermove', e => { if (dragging) onDrag(e); });
+addEventListener('pointerup', () => { dragging = false; });
+function onDrag(e) {
+  const nx = (e.clientX / innerWidth) * 2 - 1, ny = -((e.clientY / innerHeight) * 2 - 1);
+  gTarget.set(nx * 9.8, ny * 9.8, -4).clampLength(0, 9.8);
+}
+
+// ---------- Physics ----------
+const pos = new THREE.Vector3(0, 0, 0);
+const vel = new THREE.Vector3();
+const axes = ['x', 'y', 'z'];
+
+function clampBall() {
+  for (const k of axes) pos[k] = THREE.MathUtils.clamp(pos[k], -half[k] + BALL_R, half[k] - BALL_R);
+}
+
+function step(dt) {
+  g.lerp(gTarget, 1 - Math.pow(1 - SMOOTHING, dt * 60));
+  vel.addScaledVector(g, GRAVITY_SCALE * dt);
+  vel.multiplyScalar(1 - AIR_DRAG * dt);
+  pos.addScaledVector(vel, dt);
+
+  for (const k of axes) {
+    const lim = half[k] - BALL_R;
+    if (pos[k] > lim || pos[k] < -lim) {
+      const dir = Math.sign(pos[k]);
+      pos[k] = dir * lim;
+      if (vel[k] * dir > 0) vel[k] = -vel[k] * RESTITUTION;
+      if (Math.abs(vel[k]) < 0.05) vel[k] = 0;      // settle instead of jittering
+      for (const o of axes) if (o !== k) vel[o] *= 1 - WALL_FRICTION * 0.1 * dt;
+    }
+  }
+
+  // Visual rolling: spin around (up × velocity)
+  const up = g.clone().negate().normalize();
+  const axis = new THREE.Vector3().crossVectors(up, vel);
+  const speed = axis.length();
+  if (speed > 1e-4) ball.rotateOnWorldAxis(axis.normalize(), (speed / BALL_R) * dt);
+  ball.position.copy(pos);
+}
+
+// ---------- Loop ----------
+const readout = document.getElementById('readout');
+let last = performance.now();
+function frame(now) {
+  let dt = Math.min((now - last) / 1000, 1 / 20);
+  last = now;
+  const sub = 4;
+  for (let i = 0; i < sub; i++) step(dt / sub);
+  readout.textContent = `g: ${g.x.toFixed(1)}, ${g.y.toFixed(1)}, ${g.z.toFixed(1)}${gotSensor ? '' : '  (drag to tilt)'}`;
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+
+// ---------- Start / permissions ----------
+const startEl = document.getElementById('start');
+const msg = document.getElementById('msg');
+document.getElementById('go').addEventListener('click', async () => {
+  try {
+    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+      const res = await DeviceMotionEvent.requestPermission();   // iOS 13+
+      if (res !== 'granted') { msg.textContent = 'Motion access denied — drag on screen to tilt instead.'; }
+    }
+  } catch (err) {
+    msg.textContent = 'Could not get motion access (is the page on HTTPS?). Drag to tilt instead.';
+  }
+  addEventListener('devicemotion', onMotion);
+  setTimeout(() => { startEl.style.display = 'none'; }, msg.textContent ? 1600 : 0);
+});
+
+const flipBtn = document.getElementById('flip');
+flipBtn.addEventListener('click', () => { invert = !invert; flipBtn.classList.toggle('on', invert); });
+document.getElementById('reset').addEventListener('click', () => { pos.set(0, 0, 0); vel.set(0, 0, 0); });
+
+addEventListener('resize', resize);
+screen.orientation?.addEventListener?.('change', resize);
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
