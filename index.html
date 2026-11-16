@@ -37,6 +37,7 @@
   <div class="left">
     <span id="readout">–</span>
     <label>Box size <input id="scale" type="range" min="1" max="5" step="0.25"> <span id="scaleVal"></span></label>
+    <label>Speed <input id="time" type="range" min="0.25" max="1" step="0.05"> <span id="timeVal"></span></label>
   </div>
   <div class="btns">
     <button id="mute" class="on">Sound</button>
@@ -66,7 +67,10 @@ const RESTITUTION   = 0.55;  // bounciness off walls
 const WALL_FRICTION = 2.0;   // slows sliding along a wall in contact
 const AIR_DRAG      = 0.15;
 const BALL_R        = 0.22;
-const DEPTH         = 1.3;   // half-depth of the box (into the screen)
+const DEPTH         = 0.55;  // half-depth of the box (into the screen); 1 = half the screen height
+const ROLL_GRIP     = 0.35;  // wall friction coefficient: how well the ball grips to roll instead of slide
+const VIEW_DIST_M   = 0.30;  // how far your eyes are from the screen (m); sets a true-to-life perspective
+const TIME_DEFAULT  = 1;     // "Speed" slider: 1 = real time, 0.5 = half-speed slow motion
 
 // Squash & stretch (purely visual — doesn't change the physics).
 // Speeds here are real-world m/s, so the look doesn't change with the box size.
@@ -155,6 +159,10 @@ function resize() {
   camera.aspect = aspect;
   half.x = aspect * half.y;
   updateScale();
+  // Field of view as if looking through the real screen from reading distance, so the box behind
+  // it has realistic perspective (a wide FOV exaggerates depth and makes the box read as huge)
+  const screenM = (h / CSS_PX_PER_INCH) * 0.0254;
+  camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan(screenM / 2 / VIEW_DIST_M));
   // Put the camera so the box's front opening exactly fills the screen
   const dist = half.y / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
   camera.position.set(0, 0, half.z + dist);
@@ -232,6 +240,9 @@ const squashVel = new THREE.Vector3();
 const squashSide = new THREE.Vector3(1, 1, 1); // which wall (+1/-1) each axis last touched
 const pressing = new THREE.Vector3();          // how hard gravity pushes into a touched wall (0..1)
 const touching = new THREE.Vector3();          // per axis: wall side (+1/-1) the ball is resting on, or 0
+const spin = new THREE.Vector3();              // ball's angular velocity relative to the box (rad/s)
+let timeScale = TIME_DEFAULT;
+try { const v = parseFloat(localStorage.getItem('gyrobox-time')); if (v > 0) timeScale = v; } catch {}
 let stretch = 0;
 let frameImpact = 0; // hardest wall hit this frame (m/s), for sound
 
@@ -328,19 +339,19 @@ function step(dt) {
     // Euler: a sudden change in spin swings the walls into the ball (applied as an impulse)
     if (dOmega.lengthSq() > 0) {
       vel.addScaledVector(tmpA.crossVectors(dOmega, pos), -SPIN_SCALE);
+      // The ball's own spin doesn't change, so relative to the box it gains the opposite spin
+      spin.addScaledVector(dOmega, -SPIN_SCALE);
       dOmega.set(0, 0, 0);
     }
     // Coriolis (-2ω×v) and centrifugal (-ω×(ω×r))
     vel.addScaledVector(tmpA.crossVectors(wSpin, vel), -2 * dt);
     vel.addScaledVector(tmpB.crossVectors(wSpin, tmpA.crossVectors(wSpin, pos)), -dt);
-    // The ball doesn't turn with the phone, so relative to the box it turns the other way
-    const w = wSpin.length();
-    if (w > 1e-3) ball.rotateOnWorldAxis(tmpA.copy(wSpin).divideScalar(w), -w * dt);
   } else {
     dOmega.set(0, 0, 0);
   }
 
   vel.multiplyScalar(1 - AIR_DRAG * dt);
+  spin.multiplyScalar(1 - AIR_DRAG * dt);
   pos.addScaledVector(vel, dt);
 
   pressing.set(0, 0, 0);
@@ -363,6 +374,7 @@ function step(dt) {
       // Settle instead of jittering: anything gravity alone would build up in a couple of steps
       if (Math.abs(vel[k]) < Math.max(0.01 * upm, Math.abs(g[k]) * upm * dt * 2)) vel[k] = 0;
       touching[k] = dir;
+      if (into > 0) applyGrip(k, dir, into - vel[k] * dir);
       for (const o of axes) if (o !== k) vel[o] *= 1 - WALL_FRICTION * 0.1 * dt;
       squashSide[k] = dir;
       pressing[k] = Math.max(0, g[k] * dir) / 9.8;
@@ -380,11 +392,25 @@ function step(dt) {
   const stretchTarget = Math.min((vel.length() / upm) * STRETCH, MAX_STRETCH);
   stretch += (stretchTarget - stretch) * Math.min(1, dt * 12);
 
-  // Visual rolling while pressed against a wall: spin around (up × velocity)
-  const up = g.clone().negate().normalize();
-  const axis = new THREE.Vector3().crossVectors(up, vel);
-  const speed = pressing.x + pressing.y + pressing.z > 0 ? axis.length() : 0;
-  if (speed > 1e-4) ball.rotateOnWorldAxis(axis.normalize(), (speed / BALL_R) * dt);
+  // Turn the ball by its actual spin
+  const w = spin.length();
+  if (w > 1e-4) ball.rotateOnWorldAxis(tmpA.copy(spin).divideScalar(w), w * dt);
+}
+
+// Friction at the contact point: makes the ball roll instead of slide, and lets spin carry through
+// bounces. Treats the ball as a solid sphere (moment of inertia 2/5·m·R²): to stop the contact point
+// slipping, friction removes 2/7 of the slip from the ball's velocity and turns the rest into spin —
+// which is why a rolling ball speeds up at only 5/7 the rate a sliding one would.
+// normalDv = how much velocity the wall just took out along its normal (limits friction, Coulomb-style).
+const rc = new THREE.Vector3(), slip = new THREE.Vector3(), dv = new THREE.Vector3();
+function applyGrip(k, dir, normalDv) {
+  rc.set(0, 0, 0); rc[k] = dir * BALL_R;            // centre -> contact point
+  slip.crossVectors(spin, rc).add(vel); slip[k] = 0; // contact-point velocity along the wall
+  dv.copy(slip).multiplyScalar(-2 / 7);
+  const maxDv = ROLL_GRIP * normalDv;
+  if (dv.length() > maxDv) dv.setLength(maxDv);      // not enough grip: it partly slides
+  vel.add(dv);
+  spin.addScaledVector(tmpB.crossVectors(rc, dv), 2.5 / (BALL_R * BALL_R));
 }
 
 // Build ball.matrix = translate * deform * rotate. The deform is a symmetric 3x3 in world space,
@@ -421,7 +447,7 @@ function updateBallMatrix() {
 const readout = document.getElementById('readout');
 let last = performance.now();
 function frame(now) {
-  let dt = Math.min((now - last) / 1000, 1 / 20);
+  let dt = Math.min((now - last) / 1000, 1 / 20) * timeScale;
   last = now;
   // More substeps while spinning fast keeps the rotation forces stable
   const sub = Math.min(16, Math.max(4, Math.ceil(omega.length() * SPIN_SCALE * dt * 20)));
@@ -480,9 +506,17 @@ scaleIn.addEventListener('input', () => {
 });
 addEventListener('resize', showScale);
 
+const timeIn = document.getElementById('time'), timeVal = document.getElementById('timeVal');
+function showTime() { timeVal.textContent = timeScale === 1 ? 'real time' : `×${timeScale.toFixed(2)}`; }
+timeIn.value = timeScale; showTime();
+timeIn.addEventListener('input', () => {
+  timeScale = parseFloat(timeIn.value); showTime();
+  try { localStorage.setItem('gyrobox-time', String(timeScale)); } catch {}
+});
+
 const flipBtn = document.getElementById('flip');
 flipBtn.addEventListener('click', () => { invert = !invert; flipBtn.classList.toggle('on', invert); });
-document.getElementById('reset').addEventListener('click', () => { pos.set(0, 0, 0); vel.set(0, 0, 0); squash.set(0, 0, 0); squashVel.set(0, 0, 0); stretch = 0; });
+document.getElementById('reset').addEventListener('click', () => { pos.set(0, 0, 0); vel.set(0, 0, 0); squash.set(0, 0, 0); squashVel.set(0, 0, 0); stretch = 0; spin.set(0, 0, 0); });
 
 addEventListener('resize', resize);
 screen.orientation?.addEventListener?.('change', resize);
