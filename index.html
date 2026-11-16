@@ -20,6 +20,10 @@
   #hud .btns { display: flex; gap: 8px; pointer-events: auto; }
   #hud button { padding: 7px 12px; font-size: 12px; background: rgba(255,255,255,.12); color: #e8ecf3; }
   #hud button.on { background: #f2a541; color: #1a1205; }
+  #hud .left { display: flex; flex-direction: column; gap: 6px; pointer-events: auto; }
+  #hud label { display: flex; align-items: center; gap: 8px; }
+  #hud input[type=range] { width: 110px; accent-color: #f2a541; }
+  #readout.ff { color: #7fe0ff; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -30,7 +34,10 @@
   <p id="msg" style="font-size:13px"></p>
 </div>
 <div id="hud">
-  <span id="readout">g: –</span>
+  <div class="left">
+    <span id="readout">–</span>
+    <label>Scale <input id="scale" type="range" min="0.5" max="13" step="0.5"> <span id="scaleVal"></span></label>
+  </div>
   <div class="btns">
     <button id="mute" class="on">Sound</button>
     <button id="flip">Invert</button>
@@ -45,8 +52,14 @@
 import * as THREE from 'three';
 
 // ---------- Tunables ----------
-const GRAVITY_SCALE = 0.55;  // sensor m/s² -> world units/s²
-const SMOOTHING     = 0.25;  // 0..1, higher = more responsive, lower = smoother
+// How hard real acceleration pushes the ball: world units/s² per m/s². The box is 2 units tall
+// and a phone screen is ~0.15 m, so ~13 is true-to-life; lower makes the box act bigger and calmer.
+// One scale is used for gravity AND shakes on purpose: if they differed, free fall (where the
+// phone's acceleration exactly cancels gravity) wouldn't cancel, and the ball would get launched.
+const SCALE_DEFAULT = 3;
+const SPIN_SCALE    = 1;     // rotation effects (gyro): 1 = physically correct, 0 = off
+const SENSOR_TC     = 0.012; // s, tiny smoothing on sensor input (just evens out 60 Hz steps)
+const DRAG_TC       = 0.08;  // s, smoothing for the desktop drag-to-tilt fallback
 const RESTITUTION   = 0.55;  // bounciness off walls
 const WALL_FRICTION = 2.0;   // slows sliding along a wall in contact
 const AIR_DRAG      = 0.15;
@@ -148,13 +161,20 @@ function resize() {
   clampBall();
 }
 
-// ---------- Input: gravity vector ----------
+// ---------- Input: acceleration felt by the ball ----------
 // Device coords: x right, y up, z out of the screen — the same as three.js camera space here.
-// accelerationIncludingGravity reports the *reaction* to gravity, so world gravity = -reading.
-const gTarget = new THREE.Vector3(0, -9.8, 0);
-const g = gTarget.clone();
+// accelerationIncludingGravity is the phone's "specific force" (its own acceleration minus gravity).
+// A loose ball inside the phone accelerates, relative to the phone, by exactly -reading: gravity
+// when held still, thrown around when shaken, ~0 (floating) in free fall.
+const gTarget = new THREE.Vector3(0, -9.8, 0); // latest reading, as acceleration on the ball (m/s²)
+const g = gTarget.clone();                      // what the physics uses this step
+const omega = new THREE.Vector3();              // phone rotation rate in screen coords (rad/s)
+const dOmega = new THREE.Vector3();             // change in omega not yet applied to the ball
+const omegaNew = new THREE.Vector3();
 let invert = false;
 let gotSensor = false;
+let boxScale = SCALE_DEFAULT;
+try { const v = parseFloat(localStorage.getItem('gyrobox-scale')); if (v > 0) boxScale = v; } catch {}
 
 function screenAngle() {
   const a = (screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0;
@@ -170,6 +190,16 @@ function onMotion(e) {
   const sx = c * a.x - s * a.y, sy = s * a.x + c * a.y;
   const sign = invert ? 1 : -1;
   gTarget.set(sign * sx, sign * sy, sign * a.z);
+
+  // Gyro: beta = about x, gamma = about y, alpha = about z (deg/s)
+  const r = e.rotationRate;
+  if (r && r.alpha != null) {
+    const D = Math.PI / 180;
+    const wx = (r.beta || 0) * D, wy = (r.gamma || 0) * D, wz = (r.alpha || 0) * D;
+    omegaNew.set(c * wx - s * wy, s * wx + c * wy, wz);
+    dOmega.add(omegaNew).sub(omega);
+    omega.copy(omegaNew);
+  }
 }
 
 // Desktop / no-sensor fallback: drag to tilt
@@ -269,9 +299,36 @@ function clampBall() {
   for (const k of axes) pos[k] = THREE.MathUtils.clamp(pos[k], -half[k] + BALL_R, half[k] - BALL_R);
 }
 
+const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), wSpin = new THREE.Vector3();
+
 function step(dt) {
-  g.lerp(gTarget, 1 - Math.pow(1 - SMOOTHING, dt * 60));
-  vel.addScaledVector(g, GRAVITY_SCALE * dt);
+  if (gotSensor) {
+    // A world-fixed direction (gravity) turns the opposite way in phone coords as the phone rotates.
+    // Rotating the last reading by the gyro keeps fast tilts from lagging behind.
+    g.addScaledVector(tmpA.crossVectors(omega, g), -dt);
+  }
+  g.lerp(gTarget, 1 - Math.exp(-dt / (gotSensor ? SENSOR_TC : DRAG_TC)));
+  vel.addScaledVector(g, boxScale * dt);
+
+  // The box is a rotating frame, so the ball also feels the fictitious forces of rotation.
+  // (These are unit-free, so they don't depend on boxScale.)
+  wSpin.copy(omega).multiplyScalar(SPIN_SCALE);
+  if (SPIN_SCALE) {
+    // Euler: a sudden change in spin swings the walls into the ball (applied as an impulse)
+    if (dOmega.lengthSq() > 0) {
+      vel.addScaledVector(tmpA.crossVectors(dOmega, pos), -SPIN_SCALE);
+      dOmega.set(0, 0, 0);
+    }
+    // Coriolis (-2ω×v) and centrifugal (-ω×(ω×r))
+    vel.addScaledVector(tmpA.crossVectors(wSpin, vel), -2 * dt);
+    vel.addScaledVector(tmpB.crossVectors(wSpin, tmpA.crossVectors(wSpin, pos)), -dt);
+    // The ball doesn't turn with the phone, so relative to the box it turns the other way
+    const w = wSpin.length();
+    if (w > 1e-3) ball.rotateOnWorldAxis(tmpA.copy(wSpin).divideScalar(w), -w * dt);
+  } else {
+    dOmega.set(0, 0, 0);
+  }
+
   vel.multiplyScalar(1 - AIR_DRAG * dt);
   pos.addScaledVector(vel, dt);
 
@@ -284,10 +341,13 @@ function step(dt) {
       const into = vel[k] * dir;
       if (into > 0) {
         vel[k] = -vel[k] * RESTITUTION;
-        squashVel[k] += into * IMPACT_SQUISH;       // kick the squash spring
-        frameImpact = Math.max(frameImpact, into);
+        if (into > BOUNCE_MIN) {                    // ignore the constant micro-hits of resting contact
+          squashVel[k] += into * IMPACT_SQUISH;     // kick the squash spring
+          frameImpact = Math.max(frameImpact, into);
+        }
       }
-      if (Math.abs(vel[k]) < 0.05) vel[k] = 0;      // settle instead of jittering
+      // Settle instead of jittering: anything gravity alone would build up in a couple of steps
+      if (Math.abs(vel[k]) < Math.max(0.05, Math.abs(g[k]) * boxScale * dt * 2)) vel[k] = 0;
       for (const o of axes) if (o !== k) vel[o] *= 1 - WALL_FRICTION * 0.1 * dt;
       squashSide[k] = dir;
       pressing[k] = Math.max(0, g[k] * dir) / 9.8;
@@ -303,10 +363,10 @@ function step(dt) {
   const stretchTarget = Math.min(vel.length() * STRETCH, MAX_STRETCH);
   stretch += (stretchTarget - stretch) * Math.min(1, dt * 12);
 
-  // Visual rolling: spin around (up × velocity)
+  // Visual rolling while pressed against a wall: spin around (up × velocity)
   const up = g.clone().negate().normalize();
   const axis = new THREE.Vector3().crossVectors(up, vel);
-  const speed = axis.length();
+  const speed = pressing.x + pressing.y + pressing.z > 0 ? axis.length() : 0;
   if (speed > 1e-4) ball.rotateOnWorldAxis(axis.normalize(), (speed / BALL_R) * dt);
 }
 
@@ -346,12 +406,20 @@ let last = performance.now();
 function frame(now) {
   let dt = Math.min((now - last) / 1000, 1 / 20);
   last = now;
-  const sub = 4;
+  // More substeps while spinning fast keeps the rotation forces stable
+  const sub = Math.min(16, Math.max(4, Math.ceil(omega.length() * SPIN_SCALE * dt * 20)));
   for (let i = 0; i < sub; i++) step(dt / sub);
   updateBallMatrix();
   if (frameImpact > 0) { playBounce(frameImpact); frameImpact = 0; }
   updateRollSound();
-  readout.textContent = `g: ${g.x.toFixed(1)}, ${g.y.toFixed(1)}, ${g.z.toFixed(1)}${gotSensor ? '' : '  (drag to tilt)'}`;
+  if (gotSensor) {
+    const f = gTarget.length();
+    const freeFall = f < 2.5; // < ~¼ g: the phone is falling or mid-toss
+    readout.textContent = `force ${f.toFixed(1)} m/s² · spin ${omega.length().toFixed(1)} rad/s${freeFall ? ' · FREE FALL' : ''}`;
+    readout.classList.toggle('ff', freeFall);
+  } else {
+    readout.textContent = 'drag to tilt';
+  }
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
@@ -382,6 +450,14 @@ muteBtn.addEventListener('click', () => {
 });
 // Browsers may suspend audio when the tab is backgrounded; wake it on the next touch
 addEventListener('pointerdown', () => { if (actx && actx.state !== 'running') actx.resume(); });
+
+const scaleIn = document.getElementById('scale'), scaleVal = document.getElementById('scaleVal');
+function showScale() { scaleVal.textContent = boxScale.toFixed(1); }
+scaleIn.value = boxScale; showScale();
+scaleIn.addEventListener('input', () => {
+  boxScale = parseFloat(scaleIn.value); showScale();
+  try { localStorage.setItem('gyrobox-scale', String(boxScale)); } catch {}
+});
 
 const flipBtn = document.getElementById('flip');
 flipBtn.addEventListener('click', () => { invert = !invert; flipBtn.classList.toggle('on', invert); });
