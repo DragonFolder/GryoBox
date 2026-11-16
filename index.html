@@ -36,7 +36,7 @@
 <div id="hud">
   <div class="left">
     <span id="readout">–</span>
-    <label>Scale <input id="scale" type="range" min="0.5" max="13" step="0.5"> <span id="scaleVal"></span></label>
+    <label>Box size <input id="scale" type="range" min="1" max="5" step="0.25"> <span id="scaleVal"></span></label>
   </div>
   <div class="btns">
     <button id="mute" class="on">Sound</button>
@@ -52,11 +52,13 @@
 import * as THREE from 'three';
 
 // ---------- Tunables ----------
-// How hard real acceleration pushes the ball: world units/s² per m/s². The box is 2 units tall
-// and a phone screen is ~0.15 m, so ~13 is true-to-life; lower makes the box act bigger and calmer.
+// Real-world scale: the box is 2 units tall and matches the screen's physical height, so
+// upm (world units per metre) = 2 / screen height in metres. It's measured from the screen in
+// resize(). Phones lay out CSS pixels at roughly 160 per inch (Android dp / iOS points).
 // One scale is used for gravity AND shakes on purpose: if they differed, free fall (where the
 // phone's acceleration exactly cancels gravity) wouldn't cancel, and the ball would get launched.
-const SCALE_DEFAULT = 3;
+const CSS_PX_PER_INCH = 160;
+const SIZE_DEFAULT  = 1;     // "Box size" slider: 1 = real screen size, 2 = acts twice as big, …
 const SPIN_SCALE    = 1;     // rotation effects (gyro): 1 = physically correct, 0 = off
 const SENSOR_TC     = 0.012; // s, tiny smoothing on sensor input (just evens out 60 Hz steps)
 const DRAG_TC       = 0.08;  // s, smoothing for the desktop drag-to-tilt fallback
@@ -66,14 +68,15 @@ const AIR_DRAG      = 0.15;
 const BALL_R        = 0.22;
 const DEPTH         = 1.3;   // half-depth of the box (into the screen)
 
-// Squash & stretch (purely visual — doesn't change the physics)
+// Squash & stretch (purely visual — doesn't change the physics).
+// Speeds here are real-world m/s, so the look doesn't change with the box size.
 const SQUISH_STIFF  = 600;   // spring stiffness: higher = faster wobble
 const SQUISH_DAMP   = 12;    // spring damping: lower = wobbles longer
-const IMPACT_SQUISH = 1.8;   // how much a wall hit compresses the ball (per unit impact speed)
-const REST_SQUISH   = 0.06;  // flattening while resting against a wall at full gravity
-const MAX_SQUISH    = 0.4;   // clamp so it never pancakes
-const STRETCH       = 0.035; // elongation along velocity, per unit speed
-const MAX_STRETCH   = 0.15;
+const IMPACT_SQUISH = 3.5;   // how much a wall hit compresses the ball, per m/s of impact (1 m/s ≈ 15%)
+const REST_SQUISH   = 0.06;  // flattening while resting against a wall at 1 g
+const MAX_SQUISH    = 0.35;  // clamp so it never pancakes
+const STRETCH       = 0.08;  // elongation along velocity, per m/s
+const MAX_STRETCH   = 0.12;
 
 // ---------- Renderer / scene ----------
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -151,6 +154,7 @@ function resize() {
   renderer.setSize(w, h);
   camera.aspect = aspect;
   half.x = aspect * half.y;
+  updateScale();
   // Put the camera so the box's front opening exactly fills the screen
   const dist = half.y / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
   camera.position.set(0, 0, half.z + dist);
@@ -173,8 +177,13 @@ const dOmega = new THREE.Vector3();             // change in omega not yet appli
 const omegaNew = new THREE.Vector3();
 let invert = false;
 let gotSensor = false;
-let boxScale = SCALE_DEFAULT;
-try { const v = parseFloat(localStorage.getItem('gyrobox-scale')); if (v > 0) boxScale = v; } catch {}
+let boxSize = SIZE_DEFAULT;
+try { const v = parseFloat(localStorage.getItem('gyrobox-size')); if (v > 0) boxSize = v; } catch {}
+let upm = 15; // world units per metre; set properly by updateScale()
+function updateScale() {
+  const screenM = (innerHeight / CSS_PX_PER_INCH) * 0.0254;
+  upm = (half.y * 2) / (screenM * boxSize);
+}
 
 function screenAngle() {
   const a = (screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0;
@@ -222,11 +231,13 @@ const squash = new THREE.Vector3();
 const squashVel = new THREE.Vector3();
 const squashSide = new THREE.Vector3(1, 1, 1); // which wall (+1/-1) each axis last touched
 const pressing = new THREE.Vector3();          // how hard gravity pushes into a touched wall (0..1)
+const touching = new THREE.Vector3();          // per axis: wall side (+1/-1) the ball is resting on, or 0
 let stretch = 0;
-let frameImpact = 0; // hardest wall hit this frame, for sound
+let frameImpact = 0; // hardest wall hit this frame (m/s), for sound
 
 // ---------- Sound (synthesized with Web Audio, no files) ----------
-const BOUNCE_MIN   = 0.3;  // impacts slower than this are silent (stops resting-contact chatter)
+const BOUNCE_MIN   = 0.06; // m/s: impacts slower than this are silent and don't squish
+const BOUNCE_FULL  = 1.5;  // m/s: impact speed that plays at full volume
 const BOUNCE_VOL   = 0.6;
 const ROLL_VOL     = 0.12;
 let actx = null, master, rollGain, rollFilter, noiseBuf;
@@ -258,7 +269,7 @@ function initAudio() {
 
 function playBounce(speed) {
   if (!actx || !soundOn) return;
-  const amt = Math.min(1, (speed - BOUNCE_MIN) / 4);
+  const amt = Math.min(1, (speed - BOUNCE_MIN) / (BOUNCE_FULL - BOUNCE_MIN));
   if (amt <= 0) return;
   const t = actx.currentTime;
 
@@ -288,11 +299,11 @@ function playBounce(speed) {
 
 function updateRollSound() {
   if (!actx) return;
-  const touching = pressing.x + pressing.y + pressing.z > 0;
-  const speed = vel.length();
+  const onWall = pressing.x + pressing.y + pressing.z > 0;
+  const speed = vel.length() / upm; // m/s
   const t = actx.currentTime;
-  rollGain.gain.setTargetAtTime(touching ? Math.min(speed * 0.05, ROLL_VOL) : 0, t, 0.05);
-  rollFilter.frequency.setTargetAtTime(150 + speed * 250, t, 0.05);
+  rollGain.gain.setTargetAtTime(onWall ? Math.min(speed * 0.3, ROLL_VOL) : 0, t, 0.05);
+  rollFilter.frequency.setTargetAtTime(150 + speed * 1500, t, 0.05);
 }
 
 function clampBall() {
@@ -308,10 +319,10 @@ function step(dt) {
     g.addScaledVector(tmpA.crossVectors(omega, g), -dt);
   }
   g.lerp(gTarget, 1 - Math.exp(-dt / (gotSensor ? SENSOR_TC : DRAG_TC)));
-  vel.addScaledVector(g, boxScale * dt);
+  vel.addScaledVector(g, upm * dt);
 
   // The box is a rotating frame, so the ball also feels the fictitious forces of rotation.
-  // (These are unit-free, so they don't depend on boxScale.)
+  // (These are unit-free, so they don't depend on the box scale.)
   wSpin.copy(omega).multiplyScalar(SPIN_SCALE);
   if (SPIN_SCALE) {
     // Euler: a sudden change in spin swings the walls into the ball (applied as an impulse)
@@ -335,22 +346,28 @@ function step(dt) {
   pressing.set(0, 0, 0);
   for (const k of axes) {
     const lim = half[k] - BALL_R;
-    if (pos[k] > lim || pos[k] < -lim) {
+    if (Math.abs(pos[k]) >= lim - 1e-6) {          // at (or past) a wall
       const dir = Math.sign(pos[k]);
       pos[k] = dir * lim;
       const into = vel[k] * dir;
       if (into > 0) {
         vel[k] = -vel[k] * RESTITUTION;
-        if (into > BOUNCE_MIN) {                    // ignore the constant micro-hits of resting contact
-          squashVel[k] += into * IMPACT_SQUISH;     // kick the squash spring
-          frameImpact = Math.max(frameImpact, into);
+        // Only a real arrival counts as a hit. While the ball rests on this wall, gravity pushes it
+        // in a little every step; those aren't impacts and shouldn't squish or make sound.
+        const hit = into / upm; // m/s
+        if (touching[k] !== dir && hit > BOUNCE_MIN) {
+          squashVel[k] += hit * IMPACT_SQUISH;      // kick the squash spring
+          frameImpact = Math.max(frameImpact, hit);
         }
       }
       // Settle instead of jittering: anything gravity alone would build up in a couple of steps
-      if (Math.abs(vel[k]) < Math.max(0.05, Math.abs(g[k]) * boxScale * dt * 2)) vel[k] = 0;
+      if (Math.abs(vel[k]) < Math.max(0.01 * upm, Math.abs(g[k]) * upm * dt * 2)) vel[k] = 0;
+      touching[k] = dir;
       for (const o of axes) if (o !== k) vel[o] *= 1 - WALL_FRICTION * 0.1 * dt;
       squashSide[k] = dir;
       pressing[k] = Math.max(0, g[k] * dir) / 9.8;
+    } else {
+      touching[k] = 0;
     }
   }
 
@@ -360,7 +377,7 @@ function step(dt) {
     squashVel[k] += (-SQUISH_STIFF * (squash[k] - target) - SQUISH_DAMP * squashVel[k]) * dt;
     squash[k] = THREE.MathUtils.clamp(squash[k] + squashVel[k] * dt, -MAX_SQUISH * 0.6, MAX_SQUISH);
   }
-  const stretchTarget = Math.min(vel.length() * STRETCH, MAX_STRETCH);
+  const stretchTarget = Math.min((vel.length() / upm) * STRETCH, MAX_STRETCH);
   stretch += (stretchTarget - stretch) * Math.min(1, dt * 12);
 
   // Visual rolling while pressed against a wall: spin around (up × velocity)
@@ -452,12 +469,16 @@ muteBtn.addEventListener('click', () => {
 addEventListener('pointerdown', () => { if (actx && actx.state !== 'running') actx.resume(); });
 
 const scaleIn = document.getElementById('scale'), scaleVal = document.getElementById('scaleVal');
-function showScale() { scaleVal.textContent = boxScale.toFixed(1); }
-scaleIn.value = boxScale; showScale();
+function showScale() {
+  const cm = (innerHeight / CSS_PX_PER_INCH) * 2.54 * boxSize;
+  scaleVal.textContent = `×${boxSize} (${cm.toFixed(0)} cm)`;
+}
+scaleIn.value = boxSize; showScale();
 scaleIn.addEventListener('input', () => {
-  boxScale = parseFloat(scaleIn.value); showScale();
-  try { localStorage.setItem('gyrobox-scale', String(boxScale)); } catch {}
+  boxSize = parseFloat(scaleIn.value); updateScale(); showScale();
+  try { localStorage.setItem('gyrobox-size', String(boxSize)); } catch {}
 });
+addEventListener('resize', showScale);
 
 const flipBtn = document.getElementById('flip');
 flipBtn.addEventListener('click', () => { invert = !invert; flipBtn.classList.toggle('on', invert); });
