@@ -52,6 +52,15 @@ const AIR_DRAG      = 0.15;
 const BALL_R        = 0.22;
 const DEPTH         = 1.3;   // half-depth of the box (into the screen)
 
+// Squash & stretch (purely visual — doesn't change the physics)
+const SQUISH_STIFF  = 600;   // spring stiffness: higher = faster wobble
+const SQUISH_DAMP   = 12;    // spring damping: lower = wobbles longer
+const IMPACT_SQUISH = 1.8;   // how much a wall hit compresses the ball (per unit impact speed)
+const REST_SQUISH   = 0.06;  // flattening while resting against a wall at full gravity
+const MAX_SQUISH    = 0.4;   // clamp so it never pancakes
+const STRETCH       = 0.035; // elongation along velocity, per unit speed
+const MAX_STRETCH   = 0.15;
+
 // ---------- Renderer / scene ----------
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -101,6 +110,7 @@ const ball = new THREE.Mesh(
   new THREE.MeshStandardMaterial({ map: ballTexture(), roughness: 0.35, metalness: 0.1 })
 );
 ball.castShadow = true;
+ball.matrixAutoUpdate = false; // we compose position * squash * rotation ourselves
 scene.add(ball);
 
 let room = null;
@@ -176,6 +186,13 @@ const pos = new THREE.Vector3(0, 0, 0);
 const vel = new THREE.Vector3();
 const axes = ['x', 'y', 'z'];
 
+// Per-axis squash springs. squash[k] > 0 = compressed along world axis k.
+const squash = new THREE.Vector3();
+const squashVel = new THREE.Vector3();
+const squashSide = new THREE.Vector3(1, 1, 1); // which wall (+1/-1) each axis last touched
+const pressing = new THREE.Vector3();          // how hard gravity pushes into a touched wall (0..1)
+let stretch = 0;
+
 function clampBall() {
   for (const k of axes) pos[k] = THREE.MathUtils.clamp(pos[k], -half[k] + BALL_R, half[k] - BALL_R);
 }
@@ -186,23 +203,68 @@ function step(dt) {
   vel.multiplyScalar(1 - AIR_DRAG * dt);
   pos.addScaledVector(vel, dt);
 
+  pressing.set(0, 0, 0);
   for (const k of axes) {
     const lim = half[k] - BALL_R;
     if (pos[k] > lim || pos[k] < -lim) {
       const dir = Math.sign(pos[k]);
       pos[k] = dir * lim;
-      if (vel[k] * dir > 0) vel[k] = -vel[k] * RESTITUTION;
+      const into = vel[k] * dir;
+      if (into > 0) {
+        vel[k] = -vel[k] * RESTITUTION;
+        squashVel[k] += into * IMPACT_SQUISH;       // kick the squash spring
+      }
       if (Math.abs(vel[k]) < 0.05) vel[k] = 0;      // settle instead of jittering
       for (const o of axes) if (o !== k) vel[o] *= 1 - WALL_FRICTION * 0.1 * dt;
+      squashSide[k] = dir;
+      pressing[k] = Math.max(0, g[k] * dir) / 9.8;
     }
   }
+
+  // Damped springs pull each axis' squash toward its resting flatten amount
+  for (const k of axes) {
+    const target = REST_SQUISH * pressing[k];
+    squashVel[k] += (-SQUISH_STIFF * (squash[k] - target) - SQUISH_DAMP * squashVel[k]) * dt;
+    squash[k] = THREE.MathUtils.clamp(squash[k] + squashVel[k] * dt, -MAX_SQUISH * 0.6, MAX_SQUISH);
+  }
+  const stretchTarget = Math.min(vel.length() * STRETCH, MAX_STRETCH);
+  stretch += (stretchTarget - stretch) * Math.min(1, dt * 12);
 
   // Visual rolling: spin around (up × velocity)
   const up = g.clone().negate().normalize();
   const axis = new THREE.Vector3().crossVectors(up, vel);
   const speed = axis.length();
   if (speed > 1e-4) ball.rotateOnWorldAxis(axis.normalize(), (speed / BALL_R) * dt);
-  ball.position.copy(pos);
+}
+
+// Build ball.matrix = translate * deform * rotate. The deform is a symmetric 3x3 in world space,
+// so the ball squashes against walls/velocity regardless of how it has rolled.
+const rotM = new THREE.Matrix4();
+const vDir = new THREE.Vector3();
+function updateBallMatrix() {
+  // Axis squash, roughly volume-preserving: compress one axis, bulge the other two by half as much
+  const sx = squash.x, sy = squash.y, sz = squash.z;
+  const d = [1 - sx + (sy + sz) / 2, 1 - sy + (sx + sz) / 2, 1 - sz + (sx + sy) / 2];
+  // Stretch along velocity: +s along v̂, -s/2 across it  =>  -s/2·I + 1.5s·v̂v̂ᵀ
+  if (vel.lengthSq() > 1e-6) vDir.copy(vel).normalize(); else vDir.set(0, 0, 0);
+  const s = stretch, a = 1.5 * s;
+  const m = [
+    [d[0] - s / 2 + a * vDir.x * vDir.x, a * vDir.x * vDir.y, a * vDir.x * vDir.z],
+    [a * vDir.y * vDir.x, d[1] - s / 2 + a * vDir.y * vDir.y, a * vDir.y * vDir.z],
+    [a * vDir.z * vDir.x, a * vDir.z * vDir.y, d[2] - s / 2 + a * vDir.z * vDir.z],
+  ];
+  // Shift the centre toward the wall being squashed into so the ball stays in contact with it
+  const px = pos.x + squashSide.x * BALL_R * sx;
+  const py = pos.y + squashSide.y * BALL_R * sy;
+  const pz = pos.z + squashSide.z * BALL_R * sz;
+  ball.matrix.set(
+    m[0][0], m[0][1], m[0][2], px,
+    m[1][0], m[1][1], m[1][2], py,
+    m[2][0], m[2][1], m[2][2], pz,
+    0, 0, 0, 1
+  );
+  ball.matrix.multiply(rotM.makeRotationFromQuaternion(ball.quaternion));
+  ball.matrixWorldNeedsUpdate = true;
 }
 
 // ---------- Loop ----------
@@ -213,6 +275,7 @@ function frame(now) {
   last = now;
   const sub = 4;
   for (let i = 0; i < sub; i++) step(dt / sub);
+  updateBallMatrix();
   readout.textContent = `g: ${g.x.toFixed(1)}, ${g.y.toFixed(1)}, ${g.z.toFixed(1)}${gotSensor ? '' : '  (drag to tilt)'}`;
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
@@ -236,7 +299,7 @@ document.getElementById('go').addEventListener('click', async () => {
 
 const flipBtn = document.getElementById('flip');
 flipBtn.addEventListener('click', () => { invert = !invert; flipBtn.classList.toggle('on', invert); });
-document.getElementById('reset').addEventListener('click', () => { pos.set(0, 0, 0); vel.set(0, 0, 0); });
+document.getElementById('reset').addEventListener('click', () => { pos.set(0, 0, 0); vel.set(0, 0, 0); squash.set(0, 0, 0); squashVel.set(0, 0, 0); stretch = 0; });
 
 addEventListener('resize', resize);
 screen.orientation?.addEventListener?.('change', resize);
