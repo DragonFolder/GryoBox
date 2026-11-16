@@ -32,6 +32,7 @@
 <div id="hud">
   <span id="readout">g: –</span>
   <div class="btns">
+    <button id="mute" class="on">Sound</button>
     <button id="flip">Invert</button>
     <button id="reset">Reset</button>
   </div>
@@ -192,6 +193,77 @@ const squashVel = new THREE.Vector3();
 const squashSide = new THREE.Vector3(1, 1, 1); // which wall (+1/-1) each axis last touched
 const pressing = new THREE.Vector3();          // how hard gravity pushes into a touched wall (0..1)
 let stretch = 0;
+let frameImpact = 0; // hardest wall hit this frame, for sound
+
+// ---------- Sound (synthesized with Web Audio, no files) ----------
+const BOUNCE_MIN   = 0.3;  // impacts slower than this are silent (stops resting-contact chatter)
+const BOUNCE_VOL   = 0.6;
+const ROLL_VOL     = 0.12;
+let actx = null, master, rollGain, rollFilter, noiseBuf;
+let soundOn = true;
+
+function initAudio() {
+  if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  actx = new AC();
+  master = actx.createGain();
+  master.gain.value = soundOn ? 1 : 0;
+  master.connect(actx.destination);
+
+  // 2 s of white noise, reused for the hit "thwack" and the rolling rumble
+  noiseBuf = actx.createBuffer(1, actx.sampleRate * 2, actx.sampleRate);
+  const data = noiseBuf.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+
+  // Rolling: looping noise through a low-pass whose cutoff and volume follow ball speed
+  const roll = actx.createBufferSource();
+  roll.buffer = noiseBuf; roll.loop = true;
+  rollFilter = actx.createBiquadFilter();
+  rollFilter.type = 'lowpass'; rollFilter.frequency.value = 200; rollFilter.Q.value = 1.5;
+  rollGain = actx.createGain(); rollGain.gain.value = 0;
+  roll.connect(rollFilter).connect(rollGain).connect(master);
+  roll.start();
+}
+
+function playBounce(speed) {
+  if (!actx || !soundOn) return;
+  const amt = Math.min(1, (speed - BOUNCE_MIN) / 4);
+  if (amt <= 0) return;
+  const t = actx.currentTime;
+
+  // Rubbery "boing": a sine that drops in pitch, higher for harder hits
+  const osc = actx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(130 + amt * 140 + Math.random() * 20, t);
+  osc.frequency.exponentialRampToValueAtTime(55, t + 0.18);
+  const og = actx.createGain();
+  og.gain.setValueAtTime(0.0001, t);
+  og.gain.linearRampToValueAtTime(BOUNCE_VOL * amt, t + 0.005);
+  og.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+  osc.connect(og).connect(master);
+  osc.start(t); osc.stop(t + 0.3);
+
+  // Short filtered-noise "thwack" for the contact itself
+  const n = actx.createBufferSource();
+  n.buffer = noiseBuf;
+  const nf = actx.createBiquadFilter();
+  nf.type = 'lowpass'; nf.frequency.value = 900 + amt * 1800;
+  const ng = actx.createGain();
+  ng.gain.setValueAtTime(0.35 * amt, t);
+  ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.06);
+  n.connect(nf).connect(ng).connect(master);
+  n.start(t, Math.random() * 1.5, 0.08);
+}
+
+function updateRollSound() {
+  if (!actx) return;
+  const touching = pressing.x + pressing.y + pressing.z > 0;
+  const speed = vel.length();
+  const t = actx.currentTime;
+  rollGain.gain.setTargetAtTime(touching ? Math.min(speed * 0.05, ROLL_VOL) : 0, t, 0.05);
+  rollFilter.frequency.setTargetAtTime(150 + speed * 250, t, 0.05);
+}
 
 function clampBall() {
   for (const k of axes) pos[k] = THREE.MathUtils.clamp(pos[k], -half[k] + BALL_R, half[k] - BALL_R);
@@ -213,6 +285,7 @@ function step(dt) {
       if (into > 0) {
         vel[k] = -vel[k] * RESTITUTION;
         squashVel[k] += into * IMPACT_SQUISH;       // kick the squash spring
+        frameImpact = Math.max(frameImpact, into);
       }
       if (Math.abs(vel[k]) < 0.05) vel[k] = 0;      // settle instead of jittering
       for (const o of axes) if (o !== k) vel[o] *= 1 - WALL_FRICTION * 0.1 * dt;
@@ -276,6 +349,8 @@ function frame(now) {
   const sub = 4;
   for (let i = 0; i < sub; i++) step(dt / sub);
   updateBallMatrix();
+  if (frameImpact > 0) { playBounce(frameImpact); frameImpact = 0; }
+  updateRollSound();
   readout.textContent = `g: ${g.x.toFixed(1)}, ${g.y.toFixed(1)}, ${g.z.toFixed(1)}${gotSensor ? '' : '  (drag to tilt)'}`;
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
@@ -285,6 +360,7 @@ function frame(now) {
 const startEl = document.getElementById('start');
 const msg = document.getElementById('msg');
 document.getElementById('go').addEventListener('click', async () => {
+  initAudio(); // must happen inside the tap, before any await, or iOS keeps audio locked
   try {
     if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
       const res = await DeviceMotionEvent.requestPermission();   // iOS 13+
@@ -296,6 +372,16 @@ document.getElementById('go').addEventListener('click', async () => {
   addEventListener('devicemotion', onMotion);
   setTimeout(() => { startEl.style.display = 'none'; }, msg.textContent ? 1600 : 0);
 });
+
+const muteBtn = document.getElementById('mute');
+muteBtn.addEventListener('click', () => {
+  soundOn = !soundOn;
+  muteBtn.classList.toggle('on', soundOn);
+  initAudio();
+  if (master) master.gain.setTargetAtTime(soundOn ? 1 : 0, actx.currentTime, 0.02);
+});
+// Browsers may suspend audio when the tab is backgrounded; wake it on the next touch
+addEventListener('pointerdown', () => { if (actx && actx.state !== 'running') actx.resume(); });
 
 const flipBtn = document.getElementById('flip');
 flipBtn.addEventListener('click', () => { invert = !invert; flipBtn.classList.toggle('on', invert); });
